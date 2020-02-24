@@ -12,6 +12,7 @@ pragma solidity ^0.5.13;
 import { IArbitrable, IArbitrator } from "@kleros/erc-792/contracts/IArbitrator.sol";
 import { IEvidence } from "@kleros/erc-792/contracts/erc-1497/IEvidence.sol";
 import { CappedMath } from "@kleros/ethereum-libraries/contracts/CappedMath.sol";
+
 interface IdaInterface {
 
     /** @dev Get IDA service provider.
