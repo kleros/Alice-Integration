@@ -101,7 +101,7 @@ contract Validator is IArbitrable, IEvidence {
     uint public constant MULTIPLIER_DIVISOR = 10000; // Divisor parameter for multipliers.
 
     mapping (bytes32 => Report) public reports; // Maps the report ID to its data. reports[_ID].
-    mapping (uint => bytes32) public disputeIDToReportID; // Maps a dispute ID to the ID of the disputed report. disputeIDToKey[_disputeID].
+    mapping (uint => bytes32) public disputeIDToReportID; // Maps a dispute ID to the ID of the disputed report. disputeIDToReportID[_disputeID].
 
     /* Modifiers */
 
