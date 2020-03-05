@@ -28,7 +28,7 @@ interface IdaInterface {
 
 /** @title Validator
  *  Validator acts as a connector between Kleros arbitrator and Impact Delivery Agreement (IDA) contract. Its purpose is to validate reports about the fullfillment of impact promises.
- *  Each report is identified by the `key` of the corresponding impact promise.
+ *  Each report is identified by its ID which is a hash of the corresponding impact promise, IDA address and service provider.
  *  NOTE: This contract trusts that the Arbitrator is honest and will not reenter or modify its costs during a call.
  *  The arbitrator must support appeal period.
  */
@@ -61,6 +61,7 @@ contract Validator is IArbitrable, IEvidence {
 
     struct Report {
         IdaInterface ida; // The address of the IDA contract that created the promise.
+        bytes32 key; // The ID of the impact promise in the IDA contract.
         Status status; // Current status of the report.
         uint disputeID; // The ID of the dispute created in the arbitrator contract.
         uint lastActionTime; // The time of the last action performed on the report. Note that lastActionTime is updated only during timeout-related actions.
@@ -99,12 +100,23 @@ contract Validator is IArbitrable, IEvidence {
     uint public loserStakeMultiplier; // Multiplier for calculating the fee stake paid by the party that lost the previous round.
     uint public constant MULTIPLIER_DIVISOR = 10000; // Divisor parameter for multipliers.
 
-    mapping (bytes32 => Report) public reports; // Maps the report ID to its data. reports[_key].
-    mapping (uint => bytes32) public disputeIDToKey; // Maps a dispute ID to the ID of the disputed report. disputeIDToKey[_disputeID].
+    mapping (bytes32 => Report) public reports; // Maps the report ID to its data. reports[_ID].
+    mapping (uint => bytes32) public disputeIDToReportID; // Maps a dispute ID to the ID of the disputed report. disputeIDToReportID[_disputeID].
 
     /* Modifiers */
 
     modifier onlyGovernor {require(msg.sender == governor, "The caller must be the governor."); _;}
+
+    /* Events */
+
+    /**
+     *  @dev Emitted when the report about the outcome of an impact promise is created.
+     *  @param _ida The address of the IDA that created the promise.
+     *  @param _key The identifier of the impact promise.
+     *  @param _ID The ID of the report.
+     */
+    event ReportCreated(address indexed _ida, bytes32 indexed _key, bytes32 indexed _ID);
+
 
     /** @dev Constructor.
      *  @param _arbitrator The arbitrator of the contract.
@@ -190,20 +202,24 @@ contract Validator is IArbitrable, IEvidence {
      */
     function makeReport(IdaInterface _ida, bytes32 _key, Outcome _outcome) external {
         require(_ida.serviceProvider() == msg.sender, "Only the service provider can make a report.");
-        Report storage report = reports[_key];
+        bytes32 ID = keccak256(abi.encodePacked(_ida, _key, msg.sender));
+        Report storage report = reports[ID];
         require(report.status == Status.None, "The report for this impact promise has already been created.");
         report.ida = _ida;
+        report.key = _key;
         report.lastActionTime = now;
         report.status = Status.Created;
         report.outcome = _outcome;
+
+        emit ReportCreated(address(_ida), _key, ID);
     }
 
     /** @dev Challenge the report made by the service provider. Accept enough ETH to cover the deposit, reimburse the rest.
-     *  @param _key The ID of the impact promise the report was made to.
+     *  @param _ID The ID of the report.
      *  @param _evidence A link to an evidence using its URI. Ignored if not provided.
      */
-    function challengeReport(bytes32 _key, string calldata _evidence) external payable {
-        Report storage report = reports[_key];
+    function challengeReport(bytes32 _ID, string calldata _evidence) external payable {
+        Report storage report = reports[_ID];
         require(report.status == Status.Created, "The report should be in Created status.");
         require(now - report.lastActionTime <= executionTimeout, "Time to challenge the report has passed.");
 
@@ -220,15 +236,15 @@ contract Validator is IArbitrable, IEvidence {
         report.lastActionTime = now;
 
         if (bytes(_evidence).length > 0)
-            emit Evidence(arbitrator, uint(_key), msg.sender, _evidence);
+            emit Evidence(arbitrator, uint(_ID), msg.sender, _evidence);
     }
 
     /** @dev Confirm the correctness of the report made by the service provider. Accept enough ETH to cover the deposit, reimburse the rest.
-     *  @param _key The ID of the impact promise the report was made to.
+     *  @param _ID The ID of the report.
      *  @param _evidence A link to an evidence using its URI. Ignored if not provided.
      */
-    function confirmReport(bytes32 _key, string calldata _evidence) external payable {
-        Report storage report = reports[_key];
+    function confirmReport(bytes32 _ID, string calldata _evidence) external payable {
+        Report storage report = reports[_ID];
         require(report.status == Status.Challenged, "The report should be in Challenged status.");
         require(now - report.lastActionTime <= executionTimeout, "Time to confirm the report has passed.");
 
@@ -242,23 +258,23 @@ contract Validator is IArbitrable, IEvidence {
         round.hasPaid[uint(Party.Supporter)] = true;
 
         report.disputeID = arbitrator.createDispute.value(arbitrationCost)(RULING_OPTIONS, arbitratorExtraData);
-        disputeIDToKey[report.disputeID] = _key;
+        disputeIDToReportID[report.disputeID] = _ID;
         report.status = Status.Disputed;
         report.rounds.length++;
         round.feeRewards = round.feeRewards.subCap(arbitrationCost);
 
-        emit Dispute(arbitrator, report.disputeID, 0, uint(_key));
+        emit Dispute(arbitrator, report.disputeID, 0, uint(_ID));
 
         if (bytes(_evidence).length > 0)
-            emit Evidence(arbitrator, uint(_key), msg.sender, _evidence);
+            emit Evidence(arbitrator, uint(_ID), msg.sender, _evidence);
     }
 
     /** @dev Approve the report either as correct, if it wasn't challenged, or as incorrect, if it was challenged but not confirmed within the timeout.
      *  Note that if the report is considered incorrect its outcome is inverted.
-     *  @param _key The ID of the impact promise the report was made to.
+     *  @param _ID The ID of the report.
      */
-    function approveReport(bytes32 _key) external {
-        Report storage report = reports[_key];
+    function approveReport(bytes32 _ID) external {
+        Report storage report = reports[_ID];
         require(now - report.lastActionTime > executionTimeout, "The timeout has not passed yet.");
         require(report.status == Status.Created || report.status == Status.Challenged, "The report should be either in Created or Challenged status.");
         if (report.status == Status.Challenged) {
@@ -273,22 +289,22 @@ contract Validator is IArbitrable, IEvidence {
 
     /** @dev Validate the promise that is proven fullfilled.
      *  Note that most of necessary checks for this function are done in IDA's contract.
-     *  @param _key The ID of the impact promise.
+     *  @param _ID The ID of the report.
      */
-    function validate(bytes32 _key) external {
-        Report storage report = reports[_key];
+    function validate(bytes32 _ID) external {
+        Report storage report = reports[_ID];
         require(report.status == Status.Resolved, "The report has not been resolved yet.");
         require(report.outcome == Outcome.SUCCESS, "Can't validate unsuccessful report.");
-        report.ida.validatePromise(_key);
+        report.ida.validatePromise(report.key);
     }
 
     /** @dev Take up to the total amount required to fund a side of an appeal. Reimburse the rest. Create an appeal if both sides are fully funded.
-     *  @param _key The ID of the impact promise which appeal to fund.
+     *  @param _ID The ID of the report.
      *  @param _side The recipient of the contribution.
      */
-    function fundAppeal(bytes32 _key, Party _side) external payable {
+    function fundAppeal(bytes32 _ID, Party _side) external payable {
         require(_side == Party.Supporter || _side == Party.Challenger, "Invalid party.");
-        Report storage report = reports[_key];
+        Report storage report = reports[_ID];
         require(report.status == Status.Disputed, "The report must have a pending dispute.");
         (uint appealPeriodStart, uint appealPeriodEnd) = arbitrator.appealPeriod(report.disputeID);
         require(now >= appealPeriodStart && now < appealPeriodEnd, "Contributions must be made within the appeal period.");
@@ -328,11 +344,11 @@ contract Validator is IArbitrable, IEvidence {
 
     /** @dev Reimburse contributions if no disputes were raised. If a dispute was raised, send the fee stake rewards and reimbursements proportionally to the contributions made to the winner of a dispute.
      *  @param _beneficiary The address that made contributions.
-     *  @param _key The ID of the impact promise which report received contributions.
+     *  @param _ID The ID of the report.
      *  @param _round The round from which to withdraw.
      */
-    function withdrawFeesAndRewards(address payable _beneficiary, bytes32 _key, uint _round) external {
-        Report storage report = reports[_key];
+    function withdrawFeesAndRewards(address payable _beneficiary, bytes32 _ID, uint _round) external {
+        Report storage report = reports[_ID];
         Round storage round = report.rounds[_round];
         require(report.status == Status.Resolved, "The report must be resolved.");
 
@@ -370,8 +386,8 @@ contract Validator is IArbitrable, IEvidence {
      */
     function rule(uint _disputeID, uint _ruling) public {
         Party resultRuling = Party(_ruling);
-        bytes32 key = disputeIDToKey[_disputeID];
-        Report storage report = reports[key];
+        bytes32 ID = disputeIDToReportID[_disputeID];
+        Report storage report = reports[ID];
 
         Round storage round = report.rounds[report.rounds.length - 1];
         require(_ruling <= RULING_OPTIONS, "Invalid ruling option");
@@ -389,14 +405,14 @@ contract Validator is IArbitrable, IEvidence {
     }
 
     /** @dev Submit a reference to evidence. EVENT.
-     *  @param _key The ID of the report the evidence was submitted for.
+     *  @param _ID The ID of the report the evidence was submitted for.
      *  @param _evidenceURI A link to an evidence using its URI.
      */
-    function submitEvidence(bytes32 _key, string calldata _evidenceURI) external {
-        Report storage report = reports[_key];
+    function submitEvidence(bytes32 _ID, string calldata _evidenceURI) external {
+        Report storage report = reports[_ID];
         require(report.status > Status.None && report.status < Status.Resolved, "The report should exist and not be resolved.");
 
-        emit Evidence(arbitrator, uint(_key), msg.sender, _evidenceURI);
+        emit Evidence(arbitrator, uint(_ID), msg.sender, _evidenceURI);
     }
 
     /* Internal */
@@ -446,8 +462,8 @@ contract Validator is IArbitrable, IEvidence {
      *  @param _ruling Ruling given by the arbitrator. Note that 0 is reserved for "Refused to arbitrate".
      */
     function executeRuling(uint _disputeID, uint _ruling) internal {
-        bytes32 key = disputeIDToKey[_disputeID];
-        Report storage report = reports[key];
+        bytes32 ID = disputeIDToReportID[_disputeID];
+        Report storage report = reports[ID];
 
         Party winner = Party(_ruling);
 
@@ -469,27 +485,27 @@ contract Validator is IArbitrable, IEvidence {
     // ************************ //
 
     /** @dev Get the contributions made by a party for a given round of a report.
-     *  @param _key The ID of the report.
+     *  @param _ID The ID of the report.
      *  @param _round The round to query.
      *  @param _contributor The address of the contributor.
      *  @return The contributions.
      */
     function getContributions(
-        bytes32 _key,
+        bytes32 _ID,
         uint _round,
         address _contributor
     ) external view returns(uint[3] memory contributions) {
-        Report storage report = reports[_key];
+        Report storage report = reports[_ID];
         Round storage round = report.rounds[_round];
         contributions = round.contributions[_contributor];
     }
 
     /** @dev Gets the information of a round of a report.
-     *  @param _key The ID of the queried report.
+     *  @param _ID The ID of the queried report.
      *  @param _round The round to query.
      *  @return The round information.
      */
-    function getRoundInfo(bytes32 _key, uint _round)
+    function getRoundInfo(bytes32 _ID, uint _round)
         external
         view
         returns (
@@ -499,7 +515,7 @@ contract Validator is IArbitrable, IEvidence {
             uint feeRewards
         )
     {
-        Report storage report = reports[_key];
+        Report storage report = reports[_ID];
         Round storage round = report.rounds[_round];
         return (
             _round != (report.rounds.length - 1),
