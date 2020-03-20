@@ -24,6 +24,15 @@ interface IdaInterface {
      *  @param  _key The ID of the promise.
      */
     function validatePromise(bytes32 _key) external;
+
+    /** @dev Notify IDA that the report of the specific promise has been challenged.
+     *  @param  _key The ID of the promise.
+     */
+    function setValidationChallenge(bytes32 _key) external;
+
+    /** @dev Get the time when IDA ends.
+     */
+    function endTime() external returns(uint);
 }
 
 /** @title Validator
@@ -202,6 +211,7 @@ contract Validator is IArbitrable, IEvidence {
      */
     function makeReport(IdaInterface _ida, bytes32 _key, Outcome _outcome) external {
         require(_ida.serviceProvider() == msg.sender, "Only the service provider can make a report.");
+        require(now <= _ida.endTime().subCap(executionTimeout), "Time to make a report has ended");
         bytes32 ID = keccak256(abi.encodePacked(_ida, _key, msg.sender));
         Report storage report = reports[ID];
         require(report.status == Status.None, "The report for this impact promise has already been created.");
@@ -225,6 +235,7 @@ contract Validator is IArbitrable, IEvidence {
 
         report.challenger = msg.sender;
         report.status = Status.Challenged;
+        report.ida.setValidationChallenge(report.key);
         Round storage round = report.rounds[report.rounds.length++];
 
         uint arbitrationCost = arbitrator.arbitrationCost(arbitratorExtraData);
