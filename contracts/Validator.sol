@@ -25,10 +25,15 @@ interface IdaInterface {
      */
     function validatePromise(bytes32 _key) external;
 
-    /** @dev Notify IDA that the report of the specific promise has been challenged.
+    /** @dev Reject the unfullfilled promise.
      *  @param  _key The ID of the promise.
      */
-    function setValidationChallenge(bytes32 _key) external;
+    function rejectPromise(bytes32 _key) external;
+
+    /** @dev Notify IDA that the report for a specific promise has been created.
+     *  @param  _key The ID of the promise the report was made to.
+     */
+    function registerReport(bytes32 _key) external;
 
     /** @dev Get the time when IDA ends.
      */
@@ -57,7 +62,7 @@ contract Validator is IArbitrable, IEvidence {
         Created, // The report is created and can be approved if not challenged within the timeout.
         Challenged, // The report is challenged and the challenge can be approved if no one confirms the report within the timeout.
         Disputed, // The dispute was raised in Kleros Court for jurors to decide whether the report is correct or not.
-        Resolved // The report is resolved and can be validated by the IDA contract, if it's proved successful.
+        Resolved // The report is resolved and can be validated by the IDA contract if it's proved successful, or rejected if it's unsuccessful.
     }
 
     enum Party {
@@ -79,6 +84,7 @@ contract Validator is IArbitrable, IEvidence {
         Round[] rounds; // Tracks each round of a dispute.
         Party ruling; // Ruling given to the dispute by the arbitrator.
         Outcome outcome; // The reported outcome of the promise (e.g., Failure/Success).
+        bool outcomeRegistered; // True if the outcome has been registered by the IDA contract.
     }
 
     // Some arrays below have 3 elements to map with the Party enums for better readability:
@@ -200,6 +206,13 @@ contract Validator is IArbitrable, IEvidence {
         loserStakeMultiplier = _loserStakeMultiplier;
     }
 
+    /** @dev Change the governor of the contract.
+     *  @param _governor The address of the new governor.
+     */
+    function changeGovernor(address _governor) external onlyGovernor {
+        governor = _governor;
+    }
+
     // *********************** //
     // *       Reports       * //
     // *********************** //
@@ -211,7 +224,7 @@ contract Validator is IArbitrable, IEvidence {
      */
     function makeReport(IdaInterface _ida, bytes32 _key, Outcome _outcome) external {
         require(_ida.serviceProvider() == msg.sender, "Only the service provider can make a report.");
-        require(now <= _ida.endTime().subCap(executionTimeout), "Time to make a report has ended");
+        require(now <= _ida.endTime(), "Time to make a report has ended");
         bytes32 ID = keccak256(abi.encodePacked(_ida, _key, msg.sender));
         Report storage report = reports[ID];
         require(report.status == Status.None, "The report for this impact promise has already been created.");
@@ -220,6 +233,7 @@ contract Validator is IArbitrable, IEvidence {
         report.lastActionTime = now;
         report.status = Status.Created;
         report.outcome = _outcome;
+        _ida.registerReport(_key);
 
         emit ReportCreated(address(_ida), _key, ID);
     }
@@ -235,7 +249,6 @@ contract Validator is IArbitrable, IEvidence {
 
         report.challenger = msg.sender;
         report.status = Status.Challenged;
-        report.ida.setValidationChallenge(report.key);
         Round storage round = report.rounds[report.rounds.length++];
 
         uint arbitrationCost = arbitrator.arbitrationCost(arbitratorExtraData);
@@ -260,6 +273,7 @@ contract Validator is IArbitrable, IEvidence {
         require(now - report.lastActionTime <= executionTimeout, "Time to confirm the report has passed.");
 
         report.supporter = msg.sender;
+        report.status = Status.Disputed;
         Round storage round = report.rounds[report.rounds.length - 1];
 
         uint arbitrationCost = arbitrator.arbitrationCost(arbitratorExtraData);
@@ -270,7 +284,6 @@ contract Validator is IArbitrable, IEvidence {
 
         report.disputeID = arbitrator.createDispute.value(arbitrationCost)(RULING_OPTIONS, arbitratorExtraData);
         disputeIDToReportID[report.disputeID] = _ID;
-        report.status = Status.Disputed;
         report.rounds.length++;
         round.feeRewards = round.feeRewards.subCap(arbitrationCost);
 
@@ -298,15 +311,18 @@ contract Validator is IArbitrable, IEvidence {
         report.status = Status.Resolved;
     }
 
-    /** @dev Validate the promise that is proven fullfilled.
+    /** @dev Register the outcome of the report in the IDA contract.
      *  Note that most of necessary checks for this function are done in IDA's contract.
      *  @param _ID The ID of the report.
      */
-    function validate(bytes32 _ID) external {
+    function registerOutcome(bytes32 _ID) external {
         Report storage report = reports[_ID];
-        require(report.status == Status.Resolved, "The report has not been resolved yet.");
-        require(report.outcome == Outcome.SUCCESS, "Can't validate unsuccessful report.");
-        report.ida.validatePromise(report.key);
+        require(report.status == Status.Resolved && !report.outcomeRegistered, "The report should be resolved and not already registered by IDA.");
+        report.outcomeRegistered = true;
+        if (report.outcome == Outcome.SUCCESS)
+            report.ida.validatePromise(report.key);
+        else
+            report.ida.rejectPromise(report.key);
     }
 
     /** @dev Take up to the total amount required to fund a side of an appeal. Reimburse the rest. Create an appeal if both sides are fully funded.
